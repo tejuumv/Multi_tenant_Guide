@@ -1,6 +1,8 @@
 # Senior Full Stack Developer Interview Prep
 ### Role: Knowsy Platform | Focus: Backend, Architecture, Real-Time, AI Workflows
 
+The backend examples use Python with FastAPI, asyncpg, Redis, and Celery. The snippets illustrate individual patterns and assume application services, settings, and test fixtures are wired separately. See the official guides for [FastAPI authentication](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/), [FastAPI WebSockets](https://fastapi.tiangolo.com/advanced/websockets/), [Supabase Realtime for Python](https://supabase.com/docs/reference/python/subscribe), and [Celery tasks](https://docs.celeryq.dev/en/stable/userguide/tasks.html).
+
 ---
 
 ## Table of Contents
@@ -12,7 +14,7 @@
 5. [PostgreSQL Optimization & Indexing](#5-postgresql-optimization--indexing)
 6. [Event-Driven Architecture](#6-event-driven-architecture)
 7. [API Design & Authentication](#7-api-design--authentication)
-8. [Scalable Backend Design & NestJS](#8-scalable-backend-design--nestjs)
+8. [Scalable Backend Design & FastAPI](#8-scalable-backend-design--fastapi)
 9. [System Design – Multiplayer/Real-Time Platform](#9-system-design--multiplayerreal-time-platform)
 10. [AI Workflow & Code Review](#10-ai-workflow--code-review)
 11. [Distributed Systems Basics](#11-distributed-systems-basics)
@@ -87,34 +89,41 @@ SELECT * FROM tasks;
 
 **A:** Multiple layers of defense:
 
-**Layer 1 – Middleware injects tenant context:**
-```typescript
-// NestJS middleware
-@Injectable()
-export class TenantMiddleware implements NestMiddleware {
-  use(req: Request, res: Response, next: NextFunction) {
-    const tenantId = req.headers['x-tenant-id'] || this.extractFromJWT(req);
-    if (!tenantId) throw new UnauthorizedException('No tenant context');
-    req['tenantId'] = tenantId;
-    next();
-  }
-}
+**Layer 1 – A FastAPI dependency verifies tenant membership:**
+```python
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import Depends, Header, HTTPException
+
+
+async def current_tenant(
+    actor: Annotated[Actor, Depends(current_actor)],
+    x_tenant_id: Annotated[UUID | None, Header()] = None,
+) -> UUID:
+    tenant_id = x_tenant_id if x_tenant_id is not None else actor.tenant_id
+    if not await memberships.is_active(actor.user_id, tenant_id):
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return tenant_id
 ```
 
 **Layer 2 – Repository/Service layer always scopes queries:**
-```typescript
-@Injectable()
-export class TaskService {
-  constructor(private readonly db: DatabaseService) {}
+```python
+from uuid import UUID
 
-  findAll(tenantId: string) {
-    // tenantId is ALWAYS passed; never derived from body/params alone
-    return this.db.query(
-      'SELECT * FROM tasks WHERE tenant_id = $1',
-      [tenantId]
-    );
-  }
-}
+import asyncpg
+
+
+async def list_tasks(pool: asyncpg.Pool, tenant_id: UUID) -> list[dict]:
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.fetchval(
+            "SELECT set_config('app.current_tenant', $1, true)", str(tenant_id)
+        )
+        rows = await conn.fetch(
+            "SELECT id, title FROM tasks WHERE tenant_id = $1 ORDER BY id",
+            tenant_id,
+        )
+    return [dict(row) for row in rows]
 ```
 
 **Layer 3 – PostgreSQL Row Level Security (RLS):**
@@ -122,18 +131,22 @@ export class TaskService {
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON tasks
-  USING (tenant_id = current_setting('app.current_tenant')::UUID);
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::UUID);
 
--- Set at the start of each DB session
+-- Set within each transaction, before accessing tenant rows
 SELECT set_config('app.current_tenant', $1, true);
 ```
 
 **Layer 4 – Integration tests per tenant:**
-```typescript
-it('should not return Task of tenant B when querying as tenant A', async () => {
-  const result = await taskService.findAll(tenantA.id);
-  expect(result.every(t => t.tenantId === tenantA.id)).toBe(true);
-});
+```python
+def test_task_list_is_tenant_scoped(client, tenant_a_token, task_a, task_b):
+    response = client.get(
+        "/api/tasks", headers={"Authorization": f"Bearer {tenant_a_token}"}
+    )
+    assert response.status_code == 200
+    ids = {task["id"] for task in response.json()}
+    assert str(task_a.id) in ids
+    assert str(task_b.id) not in ids
 ```
 
 ---
@@ -152,19 +165,23 @@ it('should not return Task of tenant B when querying as tenant A', async () => {
 ```
 
 **Migration Strategy (Shared Schema):**
-- All tenants share schema → standard migration tools (Flyway, Prisma Migrate, TypeORM).
+- All tenants share schema → standard migration tools (Alembic or Django migrations).
 - Add columns carefully – always use nullable or default values.
 - Use feature flags to roll out new columns per tenant.
 
 **Migration Strategy (Separate Schema):**
-```typescript
-async function runMigrationsForAllTenants() {
-  const tenants = await db.query('SELECT schema_name FROM tenants');
-  for (const tenant of tenants) {
-    await db.query(`SET search_path = ${tenant.schema_name}`);
-    await runMigrations(); // run Flyway/Prisma against this schema
-  }
-}
+```python
+async def migrate_all_tenants(pool):
+    async with pool.acquire() as conn:
+        tenants = await conn.fetch("SELECT schema_name FROM tenants")
+    for tenant in tenants:
+        async with pool.acquire() as conn, conn.transaction():
+            # Quote the registered schema as an identifier and scope it to this transaction.
+            await conn.fetchval(
+                "SELECT set_config('search_path', quote_ident($1::text), true)",
+                tenant["schema_name"],
+            )
+            await run_pending_migrations(conn)
 ```
 
 ---
@@ -181,14 +198,21 @@ Without per-tenant limits, one noisy tenant can degrade service for all others.
 3. **Queue priority** – premium tenants get higher priority workers.
 4. **Compute quotas** – limit expensive query time per tenant via `statement_timeout`.
 
-```typescript
-// Redis rate limiter per tenant
-async function checkRateLimit(tenantId: string): Promise<boolean> {
-  const key = `rate:${tenantId}`;
-  const current = await redis.incr(key);
-  if (current === 1) await redis.expire(key, 60); // 1 minute window
-  return current <= TENANT_RATE_LIMIT; // e.g., 1000 req/min
-}
+```python
+import time
+from uuid import UUID
+
+from redis.asyncio import Redis
+
+
+async def within_rate_limit(redis: Redis, tenant_id: UUID, limit: int = 1_000) -> bool:
+    minute = int(time.time()) // 60
+    key = f"rate:tenant:{tenant_id}:{minute}"
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.incr(key)
+        pipe.expire(key, 120)
+        count, _ = await pipe.execute()
+    return count <= limit
 ```
 
 ---
@@ -217,54 +241,51 @@ A persistent, full-duplex TCP connection between client and server. Unlike HTTP,
 
 ---
 
-### Q: How would you implement WebSockets in a NestJS application?
+### Q: How would you implement WebSockets in a FastAPI application?
 
 **A:**
 
-```typescript
-// Install: npm install @nestjs/websockets @nestjs/platform-socket.io socket.io
+```python
+from uuid import UUID
 
-@WebSocketGateway({
-  cors: { origin: '*' },
-  namespace: '/game',
-})
-export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
-  @WebSocketServer() server: Server;
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field, ValidationError
 
-  private logger = new Logger('GameGateway');
+router = APIRouter()
 
-  afterInit(server: Server) {
-    this.logger.log('WebSocket Gateway initialized');
-  }
 
-  handleConnection(client: Socket) {
-    const tenantId = client.handshake.auth.tenantId;
-    client.join(`tenant:${tenantId}`); // join tenant-specific room
-    this.logger.log(`Client connected: ${client.id}`);
-  }
+class Answer(BaseModel):
+    choice_id: UUID
+    round_number: int = Field(ge=1)
 
-  handleDisconnect(client: Socket) {
-    this.logger.log(`Client disconnected: ${client.id}`);
-  }
 
-  @SubscribeMessage('submitAnswer')
-  handleSubmitAnswer(
-    @MessageBody() data: { sessionId: string; answer: string },
-    @ConnectedSocket() client: Socket,
-  ) {
-    const tenantId = client.handshake.auth.tenantId;
-    // process answer, update leaderboard
-    this.server.to(`session:${data.sessionId}`).emit('scoreUpdate', {
-      playerId: client.id,
-      newScore: 100,
-    });
-  }
+@router.websocket("/game/{tenant_id}/{session_id}")
+async def game_socket(
+    socket: WebSocket, tenant_id: UUID, session_id: UUID,
+    actor: Actor = Depends(websocket_actor),
+):
+    if not await games.can_join(tenant_id, session_id, actor.user_id):
+        await socket.close(code=1008)
+        return
 
-  // Broadcast to all clients in a session
-  broadcastToSession(sessionId: string, event: string, payload: any) {
-    this.server.to(`session:${sessionId}`).emit(event, payload);
-  }
-}
+    room = f"game:tenant:{tenant_id}:session:{session_id}"
+    await socket.accept()
+    await rooms.add(room, socket)
+    try:
+        while True:
+            try:
+                answer = Answer.model_validate_json(await socket.receive_text())
+            except ValidationError:
+                await socket.send_json({"event": "invalid_answer"})
+                continue
+
+            # Recheck permission, round deadline, and duplicate submissions on write.
+            score = await games.submit_answer(tenant_id, session_id, actor.user_id, answer)
+            await publish_update(redis, room, {"event": "score_update", "score": score})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await rooms.remove(room, socket)
 ```
 
 ---
@@ -275,26 +296,27 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
 The problem: Client A connects to Server 1. Client B connects to Server 2. If Server 1 emits to "room", Client B won't receive it.
 
-**Solution: Redis Pub/Sub Adapter**
+**Solution: Redis Pub/Sub**
 
-```typescript
-// main.ts
-import { IoAdapter } from '@nestjs/platform-socket.io';
-import { createAdapter } from '@socket.io/redis-adapter';
-import { createClient } from 'redis';
+```python
+import json
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+from redis.asyncio import Redis
 
-  const pubClient = createClient({ url: 'redis://localhost:6379' });
-  const subClient = pubClient.duplicate();
-  await Promise.all([pubClient.connect(), subClient.connect()]);
 
-  const io = app.get(Server);
-  io.adapter(createAdapter(pubClient, subClient));
+async def publish_update(redis: Redis, room: str, event: dict) -> None:
+    await redis.publish(f"ws:{room}", json.dumps(event))
 
-  await app.listen(3000);
-}
+
+async def forward_updates(redis: Redis, rooms) -> None:
+    # Run one listener per API worker under the FastAPI lifespan.
+    # Configure the Redis client with decode_responses=True.
+    async with redis.pubsub() as subscriber:
+        await subscriber.psubscribe("ws:game:tenant:*")
+        async for message in subscriber.listen():
+            if message["type"] == "pmessage":
+                room = message["channel"].removeprefix("ws:")
+                await rooms.broadcast(room, json.loads(message["data"]))
 ```
 
 **How it works:**
@@ -303,7 +325,7 @@ async function bootstrap() {
 3. All servers relay to their connected clients.
 
 **Additional scaling strategies:**
-- **Sticky sessions** at load balancer so each client consistently hits same server.
+- A native WebSocket stays on the worker that accepted it. On reconnect, reload the latest state and allow any worker to accept the connection.
 - **Separate WebSocket cluster** from REST API cluster.
 - Consider managed services: **Ably**, **Pusher**, **AWS API Gateway WebSocket**.
 
@@ -325,36 +347,41 @@ Client → sends intent/action → Server validates → Server updates canonical
 ```
 
 **State Sync Pattern:**
-```typescript
-interface GameState {
-  sessionId: string;
-  round: number;
-  players: Record<string, PlayerState>;
-  currentQuestion: Question;
-  timeRemaining: number;
-}
+```python
+from typing import Any
 
-// Server holds canonical state in Redis
-class GameStateManager {
-  async getState(sessionId: string): Promise<GameState> {
-    const raw = await redis.get(`game:${sessionId}`);
-    return JSON.parse(raw);
-  }
+from pydantic import BaseModel
+from redis.exceptions import WatchError
 
-  async updateState(sessionId: string, update: Partial<GameState>) {
-    const current = await this.getState(sessionId);
-    const next = { ...current, ...update };
-    await redis.set(`game:${sessionId}`, JSON.stringify(next));
-    return next;
-  }
 
-  async submitAnswer(sessionId: string, playerId: string, answer: string) {
-    // Atomic update using Redis transaction
-    const multi = redis.multi();
-    // validate, score, update
-    await multi.exec();
-  }
-}
+class GameState(BaseModel):
+    round_number: int
+    version: int
+    players: dict[str, int]
+    question: dict[str, Any]
+    ends_at_ms: int
+
+
+async def apply_answer(redis, tenant_id, session_id, user_id, answer):
+    key = f"game:tenant:{tenant_id}:session:{session_id}"
+    for _ in range(5):
+        try:
+            async with redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                raw = await pipe.get(key)
+                if raw is None:
+                    raise LookupError("Session not found")
+                state = GameState.model_validate_json(raw)
+                # Validate the round, deadline, and player before computing the next state.
+                next_state = validate_and_score(state, user_id, answer)
+                next_state.version = state.version + 1
+                pipe.multi()
+                pipe.set(key, next_state.model_dump_json(), keepttl=True)
+                await pipe.execute()
+                return next_state
+        except WatchError:
+            continue
+    raise RuntimeError("Concurrent updates prevented saving the answer")
 ```
 
 **Conflict resolution:** Last-write-wins for low-stakes; server-authoritative for scores.
@@ -369,26 +396,22 @@ class GameStateManager {
 
 **Correct approach: Server-driven timer**
 
-```typescript
-class SessionTimerService {
-  async startRound(sessionId: string, durationSeconds: number) {
-    const endsAt = Date.now() + durationSeconds * 1000;
+```python
+from datetime import datetime, timedelta, timezone
 
-    // Store end time, not countdown
-    await redis.set(`timer:${sessionId}`, endsAt);
 
-    // Broadcast start with absolute end time
-    this.gateway.broadcastToSession(sessionId, 'roundStarted', {
-      endsAt, // ISO timestamp
-      durationSeconds,
-    });
-
-    // Server-side timeout to end round
-    setTimeout(() => this.endRound(sessionId), durationSeconds * 1000);
-  }
-
-  // Client computes remaining time: endsAt - Date.now()
-}
+async def start_round(tenant_id, session_id, round_number, duration_seconds):
+    ends_at = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+    await games.save_round_deadline(tenant_id, session_id, round_number, ends_at)
+    await publish_update(
+        redis,
+        f"game:tenant:{tenant_id}:session:{session_id}",
+        {"event": "round_started", "ends_at": ends_at.isoformat()},
+    )
+    # Celery task closes the round only if it is still active and the deadline passed.
+    close_round.apply_async(
+        args=[str(tenant_id), str(session_id), round_number], eta=ends_at
+    )
 ```
 
 ---
@@ -422,44 +445,33 @@ DB Write → WAL (Write-Ahead Log) → Logical Replication Slot
         → Realtime Server → WebSocket → Client
 ```
 
-**Client subscription:**
-```typescript
-import { createClient } from '@supabase/supabase-js';
+**Python subscription using the Supabase client:**
+```python
+from supabase import acreate_client
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Listen to all inserts on a table
-const channel = supabase
-  .channel('game-scores')
-  .on(
-    'postgres_changes',
-    { event: 'INSERT', schema: 'public', table: 'scores' },
-    (payload) => {
-      console.log('New score:', payload.new);
-      updateLeaderboard(payload.new);
-    }
-  )
-  .subscribe();
-
-// Broadcast custom events (client-to-client, no DB needed)
-channel.send({
-  type: 'broadcast',
-  event: 'cursor-move',
-  payload: { x: 100, y: 200 },
-});
+async def watch_scores(url, publishable_key, access_token, refresh_token, on_score):
+    client = await acreate_client(url, publishable_key)
+    await client.auth.set_session(access_token, refresh_token)
+    channel = client.channel("game-scores")
+    await channel.on_postgres_changes(
+        "INSERT", schema="public", table="player_scores", callback=on_score
+    ).subscribe()
+    return client, channel  # Keep the client alive and remove the channel on shutdown.
 ```
 
 **Multi-tenant Realtime:**
-```typescript
-// Filter by tenant using RLS – Supabase respects RLS on realtime too
-supabase.channel(`tenant:${tenantId}`)
-  .on('postgres_changes', {
-    event: '*',
-    schema: 'public',
-    table: 'tasks',
-    filter: `tenant_id=eq.${tenantId}` // server-side filter
-  }, handler)
-  .subscribe();
+```python
+async def watch_tenant_tasks(client, tenant_id, on_task):
+    # The authenticated client's RLS policies enforce access.
+    channel = client.channel(f"tenant:{tenant_id}:tasks")
+    for event in ("INSERT", "UPDATE"):
+        channel.on_postgres_changes(
+            event, schema="public", table="tasks",
+            filter=f"tenant_id=eq.{tenant_id}", callback=on_task,
+        )
+    await channel.subscribe()
+    return channel
 ```
 
 ---
@@ -492,7 +504,7 @@ CREATE POLICY "owner_delete" ON tasks
 
 ---
 
-### Q: How do you use Supabase in a NestJS backend vs using it directly from the client?
+### Q: How do you use Supabase in a FastAPI backend vs using it directly from the client?
 
 **A:**
 
@@ -501,31 +513,26 @@ CREATE POLICY "owner_delete" ON tasks
 - RLS enforces access control.
 - Good for reads and user-specific writes.
 
-**Backend use (NestJS with service key):**
+**Backend use (FastAPI with service key):**
 - Service key bypasses RLS → must manually enforce tenant isolation.
 - Required for: admin operations, bulk processing, cross-tenant aggregation.
 
-```typescript
-// supabase.service.ts
-@Injectable()
-export class SupabaseService {
-  private client: SupabaseClient;
+```python
+import os
+from uuid import UUID
 
-  constructor() {
-    this.client = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_KEY // Never expose this to client
-    );
-  }
+from supabase import create_client
 
-  // Always scope by tenant in service layer
-  async getTasksForTenant(tenantId: string) {
-    return this.client
-      .from('tasks')
-      .select('*')
-      .eq('tenant_id', tenantId); // Explicit filtering since RLS bypassed
-  }
-}
+admin_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+
+
+def list_tasks_for_admin_job(tenant_id: UUID) -> list[dict]:
+    # Call only from an authorized backend job that already verified its tenant scope.
+    response = (
+        admin_client.table("tasks").select("id,title").eq("tenant_id", str(tenant_id))
+        .execute()
+    )
+    return response.data
 ```
 
 ---
@@ -569,40 +576,29 @@ CREATE TABLE user_roles (
 );
 ```
 
-**NestJS Guard implementation:**
-```typescript
-// permission.guard.ts
-@Injectable()
-export class PermissionGuard implements CanActivate {
-  constructor(
-    private reflector: Reflector,
-    private authService: AuthService,
-  ) {}
+**FastAPI permission dependency:**
+```python
+from fastapi import APIRouter, Depends, HTTPException
 
-  async canActivate(context: ExecutionContext): Promise<boolean> {
-    const required = this.reflector.get<string[]>('permissions', context.getHandler());
-    if (!required) return true;
+router = APIRouter()
 
-    const request = context.switchToHttp().getRequest();
-    const { userId, tenantId } = request.user;
 
-    const userPermissions = await this.authService.getPermissions(userId, tenantId);
-    return required.every(p => userPermissions.includes(p));
-  }
-}
+def require_permission(permission: str):
+    async def check(actor: Actor = Depends(current_actor), tenant_id=Depends(current_tenant)):
+        permissions = await rbac.permissions_for(actor.user_id, tenant_id)
+        if permission not in permissions:
+            raise HTTPException(status_code=403, detail="Permission denied")
+    return check
 
-// Decorator
-export const RequirePermission = (...permissions: string[]) =>
-  SetMetadata('permissions', permissions);
 
-// Usage on controller
-@Get('sessions')
-@RequirePermission('session:read')
-getSessions() { ... }
+@router.get("/sessions", dependencies=[Depends(require_permission("session:read"))])
+async def get_sessions(tenant_id=Depends(current_tenant)):
+    return await sessions.list_for_tenant(tenant_id)
 
-@Post('sessions')
-@RequirePermission('session:create')
-createSession() { ... }
+
+@router.post("/sessions", dependencies=[Depends(require_permission("session:create"))])
+async def create_session(data: SessionInput, tenant_id=Depends(current_tenant)):
+    return await sessions.create(tenant_id, data)
 ```
 
 ---
@@ -765,7 +761,7 @@ PostgreSQL spawns a process per connection. Thousands of connections → memory 
 - **Statement pooling:** Most aggressive. Rarely used.
 
 ```
-NestJS (100 instances) → PgBouncer (20 real PG connections) → PostgreSQL
+FastAPI (100 instances) → PgBouncer (20 real PG connections) → PostgreSQL
 ```
 
 **Configuration:**
@@ -802,67 +798,47 @@ Instead of services calling each other directly (synchronous), services emit eve
 
 ---
 
-### Q: How would you implement event-driven communication in NestJS?
+### Q: How would you implement event-driven communication in FastAPI?
 
 **A:**
 
-**Option 1: NestJS built-in EventEmitter (in-process, no broker)**
-```typescript
-import { EventEmitter2 } from '@nestjs/event-emitter';
+**Option 1: In-process event handlers (no broker)**
+```python
+from dataclasses import dataclass
+from uuid import UUID
 
-// Emit event
-@Injectable()
-export class GameService {
-  constructor(private events: EventEmitter2) {}
 
-  async endRound(sessionId: string) {
-    const results = await this.calculateScores(sessionId);
-    this.events.emit('round.completed', { sessionId, results });
-  }
-}
+@dataclass(frozen=True)
+class RoundCompleted:
+    tenant_id: UUID
+    session_id: UUID
+    round_number: int
 
-// Listen to event
-@Injectable()
-export class AnalyticsService {
-  @OnEvent('round.completed')
-  handleRoundCompleted(payload: { sessionId: string; results: any }) {
-    // persist analytics data
-  }
-}
 
-@Injectable()
-export class NotificationService {
-  @OnEvent('round.completed')
-  handleRoundCompleted(payload: { sessionId: string; results: any }) {
-    // send push notifications
-  }
-}
+async def notify_round_completed(event: RoundCompleted) -> None:
+    # In-process handlers run in the same worker and have no durable delivery.
+    await analytics.record_round(event)
+    await notifications.record_round(event)
 ```
 
-**Option 2: Redis Streams / BullMQ (cross-process, durable)**
-```typescript
-import { InjectQueue } from '@nestjs/bull';
-import { Queue } from 'bull';
+**Option 2: Celery with a broker (cross-process)**
+```python
+from uuid import UUID
 
-@Injectable()
-export class GameService {
-  constructor(@InjectQueue('analytics') private analyticsQueue: Queue) {}
+from app.celery_app import celery_app
 
-  async endRound(sessionId: string) {
-    await this.analyticsQueue.add('round-completed', { sessionId }, {
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 1000 },
-    });
-  }
-}
 
-@Processor('analytics')
-export class AnalyticsProcessor {
-  @Process('round-completed')
-  async handle(job: Job<{ sessionId: string }>) {
-    await this.processRoundAnalytics(job.data.sessionId);
-  }
-}
+@celery_app.task(autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=3)
+def record_round_analytics(tenant_id: str, session_id: str, round_number: int):
+    # Upsert against a unique tenant/session/round key so retries are safe.
+    analytics.upsert_round(UUID(tenant_id), UUID(session_id), round_number)
+
+
+def enqueue_round_analytics(event: RoundCompleted) -> None:
+    record_round_analytics.apply_async(
+        args=[str(event.tenant_id), str(event.session_id), event.round_number],
+        queue="analytics",
+    )
 ```
 
 **Option 3: Kafka/RabbitMQ for true distributed event streaming at scale.**
@@ -888,26 +864,42 @@ CREATE TABLE outbox_events (
 );
 ```
 
-```typescript
-// Business operation + event in one transaction
-async function endRound(sessionId: string) {
-  await db.transaction(async (trx) => {
-    await trx.query('UPDATE game_sessions SET status = $1 WHERE id = $2', ['completed', sessionId]);
-    await trx.query(
-      'INSERT INTO outbox_events (event_type, payload) VALUES ($1, $2)',
-      ['round.completed', JSON.stringify({ sessionId })]
-    );
-  });
-}
+```python
+import json
 
-// Separate poller publishes outbox events
-async function pollOutbox() {
-  const events = await db.query('SELECT * FROM outbox_events WHERE published = FALSE LIMIT 100');
-  for (const event of events.rows) {
-    await messageBroker.publish(event.event_type, event.payload);
-    await db.query('UPDATE outbox_events SET published = TRUE WHERE id = $1', [event.id]);
-  }
-}
+
+async def end_session(pool, tenant_id, session_id):
+    async with pool.acquire() as conn, conn.transaction():
+        updated = await conn.fetchval(
+            '''
+            UPDATE game_sessions SET status = 'completed', ended_at = now()
+            WHERE tenant_id = $1 AND id = $2 AND status = 'active'
+            RETURNING id
+            ''',
+            tenant_id, session_id,
+        )
+        if updated is not None:
+            await conn.execute(
+                "INSERT INTO outbox_events (event_type, payload) VALUES ($1, $2::jsonb)",
+                "session.completed",
+                json.dumps({"tenantId": str(tenant_id), "sessionId": str(session_id)}),
+            )
+
+
+async def publish_outbox_batch(pool, broker):
+    async with pool.acquire() as conn, conn.transaction():
+        events = await conn.fetch(
+            '''
+            SELECT id, event_type, payload FROM outbox_events WHERE published = FALSE
+            ORDER BY created_at, id LIMIT 100 FOR UPDATE SKIP LOCKED
+            '''
+        )
+        for event in events:
+            # Wait for the broker's acknowledgement; consumers deduplicate by event ID.
+            await broker.publish(event["event_type"], event["payload"], event_id=str(event["id"]))
+            await conn.execute(
+                "UPDATE outbox_events SET published = TRUE WHERE id = $1", event["id"]
+            )
 ```
 
 ---
@@ -947,23 +939,40 @@ GET https://api.knowsy.com/api/sessions  (with header: X-Tenant-ID: acme)
 6. On logout → invalidate Refresh Token in DB/Redis
 ```
 
-**NestJS JWT guard:**
-```typescript
-@Injectable()
-export class JwtAuthGuard extends AuthGuard('jwt') {
-  handleRequest(err: any, user: any, info: any) {
-    if (err || !user) throw err || new UnauthorizedException('Invalid token');
-    return user;
-  }
-}
+**FastAPI JWT authentication dependency:**
+```python
+from dataclasses import dataclass
+from typing import Annotated
+from uuid import UUID
 
-// JWT strategy extracts tenantId
-@Injectable()
-export class JwtStrategy extends PassportStrategy(Strategy) {
-  validate(payload: JwtPayload) {
-    return { userId: payload.sub, tenantId: payload.tenantId, roles: payload.roles };
-  }
-}
+import jwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+bearer = HTTPBearer()
+
+
+@dataclass(frozen=True)
+class Actor:
+    user_id: UUID
+    tenant_id: UUID
+
+
+async def current_actor(
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer)],
+) -> Actor:
+    try:
+        claims = jwt.decode(
+            credentials.credentials, settings.jwt_public_key, algorithms=["RS256"],
+            audience=settings.jwt_audience, issuer=settings.jwt_issuer,
+            options={"require": ["exp", "sub", "tenantId"]},
+        )
+        return Actor(UUID(claims["sub"]), UUID(claims["tenantId"]))
+    except (jwt.InvalidTokenError, KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=401, detail="Invalid access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
 ```
 
 ---
@@ -984,62 +993,52 @@ GET /api/sessions
 Accept: application/vnd.knowsy.v2+json
 ```
 
-**NestJS URL versioning:**
-```typescript
-// main.ts
-app.enableVersioning({ type: VersioningType.URI });
+**FastAPI URL versioning:**
+```python
+from fastapi import APIRouter, FastAPI
 
-// Controller
-@Controller({ path: 'sessions', version: '1' })
-export class SessionControllerV1 { ... }
+from app.game.api_v1 import router as sessions_v1
+from app.game.api_v2 import router as sessions_v2
 
-@Controller({ path: 'sessions', version: '2' })
-export class SessionControllerV2 { ... }
+app = FastAPI()
+for version, sessions_router in (("v1", sessions_v1), ("v2", sessions_v2)):
+    api = APIRouter(prefix=f"/api/{version}")
+    api.include_router(sessions_router, prefix="/sessions")
+    app.include_router(api)
 ```
 
 **Strategy:** Never break v1. Deprecate with Sunset header. Maintain 2 versions max.
 
 ---
 
-## 8. Scalable Backend Design & NestJS
+## 8. Scalable Backend Design & FastAPI
 
-### Q: How do you structure a NestJS application for a large-scale SaaS product?
+### Q: How do you structure a FastAPI application for a large-scale SaaS product?
 
 **A:**
 
-```
-src/
-  modules/
-    auth/
-      auth.module.ts
-      auth.service.ts
-      auth.controller.ts
-      strategies/jwt.strategy.ts
-      guards/jwt.guard.ts
-    tenant/
-      tenant.module.ts
-      tenant.service.ts
-      tenant.middleware.ts
-    game/
-      game.module.ts
-      game.service.ts
-      game.gateway.ts      ← WebSocket
-      game.controller.ts
-      dto/
-      entities/
-    analytics/
-      analytics.module.ts
-      analytics.processor.ts  ← BullMQ consumer
-  common/
-    filters/http-exception.filter.ts
-    interceptors/logging.interceptor.ts
-    decorators/current-tenant.decorator.ts
-    guards/permission.guard.ts
-  config/
-    database.config.ts
-    redis.config.ts
-  app.module.ts
-  main.ts
+```text
+app/
+  main.py                # FastAPI application and router registration
+  config.py
+  database.py
+  celery_app.py
+  auth/
+    dependencies.py      # Verified identity and permission checks
+    service.py
+  tenants/
+    dependencies.py      # Active tenant membership
+    repository.py
+  game/
+    router.py
+    websocket.py
+    service.py
+    repository.py
+    schemas.py           # Pydantic request and response models
+  analytics/
+    tasks.py             # Celery worker tasks
+tests/
+  integration/
 ```
 
 **Key patterns:**
@@ -1050,34 +1049,39 @@ src/
 
 ---
 
-### Q: How do you handle background jobs and scheduled tasks in NestJS?
+### Q: How do you handle background jobs and scheduled tasks in FastAPI?
 
 **A:**
 
-```typescript
-// BullMQ for background jobs
-@Module({
-  imports: [
-    BullModule.registerQueue({ name: 'email' }),
-    BullModule.registerQueue({ name: 'analytics' }),
-  ],
-})
+```python
+import os
 
-// Schedule with @nestjs/schedule
-@Injectable()
-export class CleanupService {
-  @Cron('0 2 * * *') // Every day at 2am
-  async cleanExpiredSessions() {
-    await this.db.query(
-      "DELETE FROM game_sessions WHERE ended_at < NOW() - INTERVAL '90 days'"
-    );
-  }
+from celery import Celery
+from celery.schedules import crontab
 
-  @Interval(60000) // Every 60 seconds
-  async syncLeaderboardCache() {
-    // Refresh Redis leaderboard cache from DB
-  }
+celery_app = Celery("knowsy", broker=os.environ["CELERY_BROKER_URL"])
+celery_app.conf.timezone = "UTC"
+celery_app.conf.beat_schedule = {
+    "clean-expired-sessions": {
+        "task": "maintenance.clean_expired_sessions",
+        "schedule": crontab(hour=2, minute=0),
+    },
+    "sync-leaderboards": {
+        "task": "maintenance.sync_leaderboards",
+        "schedule": 60.0,
+    },
 }
+
+
+@celery_app.task(name="maintenance.clean_expired_sessions")
+def clean_expired_sessions():
+    # A dedicated maintenance job iterates tenants and deletes in bounded batches.
+    maintenance.delete_old_sessions(retention_days=90)
+
+
+@celery_app.task(name="maintenance.sync_leaderboards")
+def sync_leaderboards():
+    maintenance.refresh_tenant_leaderboards()
 ```
 
 ---
@@ -1108,14 +1112,14 @@ export class CleanupService {
                │                │                  │
      ┌─────────▼──────┐ ┌───────▼──────┐ ┌────────▼────────┐
      │  REST API      │ │  WebSocket   │ │  Auth Service   │
-     │  (NestJS)      │ │  Gateway     │ │  (GoTrue/Custom)│
+     │  (FastAPI)      │ │  Gateway     │ │  (GoTrue/Custom)│
      └─────────┬──────┘ └───────┬──────┘ └────────┬────────┘
                │                │                  │
      ┌─────────▼────────────────▼──────────────────▼────────┐
      │                    Redis                              │
      │  - Session state, leaderboards, rate limiting        │
      │  - Pub/Sub for WS horizontal scaling                 │
-     │  - BullMQ job queues                                 │
+     │  - Celery job queues                                 │
      └───────────────────────────┬───────────────────────────┘
                                  │
      ┌───────────────────────────▼───────────────────────────┐
@@ -1149,7 +1153,7 @@ Host creates session → Generate session code → Players join via code
 
 **Scaling:**
 - Horizontal scaling of REST + WS servers behind load balancer.
-- Redis adapter for WS cluster.
+- Redis Pub/Sub across WebSocket workers.
 - Read replicas for analytics queries.
 - CDN for static assets.
 
@@ -1162,8 +1166,8 @@ Host creates session → Generate session code → Players join via code
 **Bottlenecks to address:**
 
 1. **WebSocket connections:**
-   - Node.js can handle ~50k WS connections per instance.
-   - Scale horizontally; use Redis adapter for cross-instance messaging.
+   - Load-test connection capacity per ASGI worker using representative message rates and payload sizes.
+   - Scale horizontally; use Redis Pub/Sub for cross-instance messaging.
    - Group players by session → targeted broadcasts (not broadcast-all).
 
 2. **Database:**
@@ -1200,12 +1204,13 @@ This is a high-value skill for this role. AI tools generate code fast but introd
 - Ask: "What happens when the input is empty/null/huge?"
 
 **2. Security review**
-```typescript
-// AI might generate this – DANGEROUS
-const user = await db.query(`SELECT * FROM users WHERE id = '${userId}'`); // SQL injection
-
-// Correct
-const user = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+```python
+async def get_user(conn, tenant_id, user_id):
+    # Pass values separately from the SQL statement.
+    return await conn.fetchrow(
+        "SELECT id, display_name FROM users WHERE tenant_id = $1 AND id = $2",
+        tenant_id, user_id,
+    )
 ```
 
 Common AI security mistakes:
@@ -1216,39 +1221,50 @@ Common AI security mistakes:
 - JWT verified but `tenantId` not checked.
 
 **3. Performance issues**
-```typescript
-// AI might generate – N+1 query
-for (const session of sessions) {
-  session.scores = await db.query('SELECT * FROM scores WHERE session_id = $1', [session.id]);
-}
-
-// Correct – single query with join
-const sessions = await db.query(`
-  SELECT s.*, json_agg(sc.*) as scores
-  FROM sessions s
-  LEFT JOIN scores sc ON sc.session_id = s.id
-  GROUP BY s.id
-`);
+```python
+async def list_sessions_with_scores(conn, tenant_id):
+    return await conn.fetch(
+        '''
+        SELECT s.id,
+               COALESCE(
+                   jsonb_agg(jsonb_build_object('user_id', p.user_id, 'score', p.score))
+                       FILTER (WHERE p.id IS NOT NULL),
+                   '[]'::jsonb
+               ) AS scores
+        FROM game_sessions AS s
+        LEFT JOIN player_scores AS p ON p.session_id = s.id AND p.tenant_id = s.tenant_id
+        WHERE s.tenant_id = $1
+        GROUP BY s.id
+        ''',
+        tenant_id,
+    )
 ```
 
 **4. Architecture violations**
 - Business logic leaking into controllers.
 - Direct DB access from route handlers (should go through service layer).
-- Missing error handling / unhandled promise rejections.
+- Missing error handling / unhandled exceptions in async tasks.
 
 **5. Type safety**
-```typescript
-// AI might use 'any'
-function process(data: any) { ... }
+```python
+from uuid import UUID
 
-// Should be typed
-function process(data: PlayerScore): void { ... }
+from pydantic import BaseModel, Field
+
+
+class PlayerScore(BaseModel):
+    player_id: UUID
+    score: int = Field(ge=0)
+
+
+def parse_score(raw: str) -> PlayerScore:
+    return PlayerScore.model_validate_json(raw)
 ```
 
 **Your review checklist:**
-```
-□ Does it compile without TypeScript errors?
-□ Are all inputs validated (class-validator, zod)?
+```text
+□ Does it pass the Python type checker?
+□ Are all inputs validated (Pydantic)?
 □ Are all DB queries parameterized?
 □ Is auth/authorization checked?
 □ Are errors handled?
@@ -1362,19 +1378,25 @@ Prevents cascading failures when a downstream service is slow or down.
 States: Closed (normal) → Open (failing, reject calls) → Half-Open (test recovery)
 ```
 
-```typescript
-// Using opossum library
-import CircuitBreaker from 'opossum';
+```python
+import httpx
+from pybreaker import CircuitBreaker, CircuitBreakerError
 
-const breaker = new CircuitBreaker(callExternalService, {
-  timeout: 3000,         // Fail if takes > 3s
-  errorThresholdPercentage: 50, // Open if 50% of calls fail
-  resetTimeout: 30000,   // Try again after 30s
-});
+breaker = CircuitBreaker(fail_max=5, reset_timeout=30)
 
-breaker.fallback(() => getCachedData()); // Return cached data when open
 
-const result = await breaker.fire(payload);
+@breaker
+def fetch_standings(http: httpx.Client, url: str) -> dict:
+    response = http.get(url, timeout=3.0)
+    response.raise_for_status()
+    return response.json()
+
+
+def standings(http: httpx.Client, url: str, cached: dict) -> dict:
+    try:
+        return fetch_standings(http, url)
+    except (CircuitBreakerError, httpx.HTTPError):
+        return cached
 ```
 
 ---
@@ -1390,7 +1412,7 @@ const result = await breaker.fire(payload);
 **Architecture:**
 
 ```
-Game Events → BullMQ Queue → Analytics Worker → Write to analytics DB
+Game Events → Celery Queue → Analytics Worker → Write to analytics DB
                                               → Supabase Realtime → Dashboard
 ```
 
@@ -1443,7 +1465,7 @@ GROUP BY tenant_id;
 | Service | Use |
 |---|---|
 | **Cloud Run** | Deploy stateless REST API (auto-scaling, pay per use) |
-| **GKE (Kubernetes)** | Deploy stateful WebSocket servers with sticky sessions |
+| **GKE (Kubernetes)** | Deploy WebSocket workers and scale them based on measured load |
 | **Cloud SQL / Supabase** | PostgreSQL managed database |
 | **Memorystore (Redis)** | Managed Redis for sessions, queues, pub/sub |
 | **Cloud Pub/Sub** | Durable event streaming between services |
@@ -1481,16 +1503,21 @@ GitHub Push → Cloud Build (CI/CD) → Docker Image → Artifact Registry
 - Fix: Always use parameterized queries.
 
 **4. IDOR (Insecure Direct Object Reference)**
-```typescript
-// DANGEROUS – attacker can access any user's data
-GET /api/users/456/sessions
+```python
+from fastapi import HTTPException
 
-// Always verify ownership
-const session = await db.query(
-  'SELECT * FROM sessions WHERE id = $1 AND tenant_id = $2',
-  [sessionId, req.user.tenantId]
-);
-if (!session) throw new ForbiddenException();
+
+async def get_player_score(conn, tenant_id, session_id, user_id):
+    score = await conn.fetchrow(
+        '''
+        SELECT id, score FROM player_scores
+        WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
+        ''',
+        tenant_id, session_id, user_id,
+    )
+    if score is None:
+        raise HTTPException(status_code=404, detail="Score not found")
+    return dict(score)
 ```
 
 **5. Rate limiting abuse**
@@ -1502,18 +1529,19 @@ if (!session) throw new ForbiddenException();
 - Fix: Environment variables, GCP Secret Manager, pre-commit hooks to detect secrets.
 
 **7. WebSocket authentication**
-```typescript
-// Always authenticate on WS connection
-handleConnection(client: Socket) {
-  const token = client.handshake.auth.token;
-  try {
-    const payload = this.jwt.verify(token);
-    client.data.user = payload;
-    client.join(`tenant:${payload.tenantId}`);
-  } catch {
-    client.disconnect();
-  }
-}
+```python
+from fastapi import WebSocket, WebSocketException, status
+
+
+async def websocket_actor(socket: WebSocket) -> Actor:
+    if socket.headers.get("origin") not in settings.allowed_web_origins:
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    # This short-lived session is set by the login flow in an HttpOnly, Secure cookie.
+    session_id = socket.cookies.get("session")
+    actor = await auth.actor_for_session(session_id) if session_id else None
+    if actor is None:
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    return actor
 ```
 
 ---
@@ -1523,16 +1551,16 @@ handleConnection(client: Socket) {
 | Topic | Key Points |
 |---|---|
 | Multi-tenancy | Row-level (tenant_id), Schema-level, DB-level. Use RLS in Postgres. |
-| WebSockets | NestJS Gateway + Redis adapter for horizontal scaling. Server-authoritative state. |
-| Supabase Realtime | Logical replication → WAL → WebSocket. RLS respected in realtime. |
-| RBAC | Roles → Permissions → Users. Guards + decorators in NestJS. |
+| WebSockets | FastAPI WebSockets + Redis Pub/Sub for horizontal scaling. Server-authoritative state. |
+| Supabase Realtime | PostgreSQL WAL → logical replication → WebSocket. RLS applies to Postgres Changes inserts and updates. |
+| RBAC | Roles → Permissions → Users. FastAPI dependencies check tenant permissions. |
 | PostgreSQL Indexing | B-Tree (default), GIN (JSONB/FTS), Partial, Covering. EXPLAIN ANALYZE. |
-| Event-Driven | EventEmitter2 (in-process), BullMQ (cross-process), Outbox pattern for reliability. |
+| Event-Driven | Python event handlers (in-process), Celery (cross-process), Outbox pattern for reliability. |
 | Leaderboard | Redis sorted sets (ZADD, ZREVRANGE). Persist to DB on session end. |
 | AI Code Review | Security, N+1 queries, missing validation, type safety, architecture violations. |
 | CAP Theorem | Partition always happens. Choose C (accuracy) vs A (availability) per feature. |
 | Circuit Breaker | Closed → Open → Half-Open. Prevent cascading failures. |
-| Scaling WS | Redis Pub/Sub adapter. Sticky sessions at load balancer. |
+| Scaling WS | Redis Pub/Sub across workers. Reload state on reconnect. |
 | Connection Pooling | PgBouncer. Transaction mode = most efficient. Max ~20 real connections. |
 
 ---

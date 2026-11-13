@@ -2,6 +2,8 @@
 
 > A comprehensive reference for system design interviews and real-world implementation.
 
+The backend examples use Python with FastAPI, asyncpg, Redis, and Celery. The snippets assume your app provides verified identity, membership lookups, database connections, and worker configuration. See the official guides for [FastAPI authentication](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/) and [Celery tasks](https://docs.celeryq.dev/en/stable/userguide/tasks.html).
+
 ---
 
 ## Table of Contents
@@ -199,42 +201,55 @@ PostgreSQL RLS prevents accidental data leakage at the database level.
 -- Create a policy on the tasks table
 CREATE POLICY tenant_policy
 ON tasks
-USING (tenant_id = current_setting('app.tenant_id')::int);
+USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int);
 
 -- Enable RLS
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 ```
 
-This means even if a developer forgets `WHERE tenant_id = ?`, the DB enforces it automatically.
+Set the tenant context within the transaction and run requests under a database role subject to RLS. PostgreSQL then enforces the policy even if a query omits the tenant filter.
 
 ---
 
-### 4. Tenant Middleware
+### 4. Tenant Context
 
-Extracts tenant context from the request and makes it available globally.
+A route dependency resolves the requested tenant and checks the signed-in user’s active membership before passing the tenant ID to the handler.
 
-**NestJS Example:**
+**FastAPI dependency:**
 
-```typescript
-@Injectable()
-export class TenantMiddleware implements NestMiddleware {
-  use(req: Request, res: Response, next: NextFunction) {
-    const tenantId = req.headers['x-tenant-id'];
-    if (!tenantId) throw new UnauthorizedException('Tenant ID missing');
-    req['tenantId'] = tenantId;
-    next();
-  }
-}
+```python
+from typing import Annotated
+
+from fastapi import Depends, Header, HTTPException
+
+
+async def current_tenant(
+    actor: Annotated[Actor, Depends(current_actor)],
+    x_tenant_id: Annotated[int | None, Header(gt=0)] = None,
+) -> int:
+    tenant_id = x_tenant_id if x_tenant_id is not None else actor.tenant_id
+    if not await memberships.is_active(actor.user_id, tenant_id):
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return tenant_id
 ```
 
-**Express Example:**
+**FastAPI route using verified tenant context:**
 
-```javascript
-app.use((req, res, next) => {
-  const tenantId = req.subdomains[0] || req.headers['x-tenant-id'];
-  req.tenantId = tenantId;
-  next();
-});
+```python
+from typing import Annotated
+
+import asyncpg
+from fastapi import APIRouter, Depends
+
+router = APIRouter()
+
+
+@router.get("/tasks")
+async def list_tasks(
+    tenant_id: Annotated[int, Depends(current_tenant)],
+    pool: Annotated[asyncpg.Pool, Depends(get_pool)],
+) -> list[dict]:
+    return await TaskRepository(pool, tenant_id).list_all()
 ```
 
 ---
@@ -243,14 +258,25 @@ app.use((req, res, next) => {
 
 Every DB query is wrapped in a class that automatically applies tenant filtering.
 
-```typescript
-class TaskRepository {
-  constructor(private tenantId: number) {}
+```python
+import asyncpg
 
-  findAll() {
-    return db.query('SELECT * FROM tasks WHERE tenant_id = $1', [this.tenantId]);
-  }
-}
+
+class TaskRepository:
+    def __init__(self, pool: asyncpg.Pool, tenant_id: int):
+        self.pool = pool
+        self.tenant_id = tenant_id
+
+    async def list_all(self) -> list[dict]:
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.fetchval(
+                "SELECT set_config('app.tenant_id', $1, true)", str(self.tenant_id)
+            )
+            rows = await conn.fetch(
+                "SELECT id, title FROM tasks WHERE tenant_id = $1 ORDER BY id",
+                self.tenant_id,
+            )
+        return [dict(row) for row in rows]
 ```
 
 ---
@@ -333,9 +359,15 @@ tenant:101:user:10
 ```
 
 Redis example:
-```javascript
-const cacheKey = `tenant:${tenantId}:tasks:${taskId}`;
-await redis.set(cacheKey, JSON.stringify(task), 'EX', 3600);
+```python
+import json
+
+from redis.asyncio import Redis
+
+
+async def cache_task(redis: Redis, tenant_id: int, task_id: int, task: dict) -> None:
+    key = f"tenant:{tenant_id}:tasks:{task_id}"
+    await redis.set(key, json.dumps(task), ex=3_600)
 ```
 
 ---
@@ -396,8 +428,8 @@ Every log entry must carry the tenant context:
 
 ```
 Request
-  → Tenant Middleware (extract & validate tenantId)
-  → Auth Guard (verify JWT tenantId matches)
+  → Authentication dependency (verify access token)
+  → Tenant dependency (verify active membership for selected tenant)
   → Scoped Repository (inject tenantId in all queries)
   → Row-Level Security (DB enforces at storage layer)
 ```
@@ -408,12 +440,28 @@ Request
 
 Without per-tenant rate limiting, one tenant can DDoS the entire platform.
 
-```javascript
-// Redis-based per-tenant rate limiter
-const key = `rate_limit:tenant:${tenantId}`;
-const requests = await redis.incr(key);
-if (requests === 1) await redis.expire(key, 60); // 1-minute window
-if (requests > 1000) throw new TooManyRequestsException();
+```python
+import time
+
+from redis.asyncio import Redis
+
+
+async def within_rate_limit(redis: Redis, tenant_id: int, limit: int = 1_000) -> bool:
+    minute = int(time.time()) // 60
+    key = f"rate:tenant:{tenant_id}:{minute}"
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.incr(key)
+        pipe.expire(key, 120)
+        count, _ = await pipe.execute()
+    return count <= limit
+
+
+from fastapi import HTTPException
+
+
+async def enforce_rate_limit(redis: Redis, tenant_id: int) -> None:
+    if not await within_rate_limit(redis, tenant_id):
+        raise HTTPException(status_code=429, detail="Tenant rate limit exceeded")
 ```
 
 ---
@@ -480,14 +528,13 @@ feature_name
 enabled
 ```
 
-```typescript
-async function isFeatureEnabled(tenantId: number, feature: string): Promise<boolean> {
-  const flag = await db.query(
-    'SELECT enabled FROM tenant_feature_flags WHERE tenant_id = $1 AND feature_name = $2',
-    [tenantId, feature]
-  );
-  return flag?.enabled ?? false;
-}
+```python
+async def is_feature_enabled(conn, tenant_id: int, feature: str) -> bool:
+    value = await conn.fetchval(
+        "SELECT enabled FROM tenant_feature_flags WHERE tenant_id = $1 AND feature_name = $2",
+        tenant_id, feature,
+    )
+    return value is True
 ```
 
 ---
@@ -555,20 +602,19 @@ Every event must carry tenant context:
 
 ### Background Job Isolation
 
-```typescript
-// Always scope background jobs to a tenant
-await queue.add('send-weekly-report', {
-  tenantId: 101,
-  userId: 88,
-});
+```python
+from app.celery_app import celery_app
 
-// Worker must always read and apply tenantId
-queue.process('send-weekly-report', async (job) => {
-  const { tenantId, userId } = job.data;
-  // set tenant context before doing anything
-  setTenantContext(tenantId);
-  await generateReport(userId);
-});
+
+@celery_app.task
+def send_weekly_report(tenant_id: int, user_id: int, week: str) -> None:
+    if memberships.is_active_sync(user_id, tenant_id):
+        # Queries, storage paths, and the job's deduplication key include tenant_id.
+        reports.generate_for_user(tenant_id=tenant_id, user_id=user_id, week=week)
+
+
+def enqueue_weekly_report(tenant_id: int, user_id: int, week: str) -> None:
+    send_weekly_report.delay(tenant_id, user_id, week)
 ```
 
 ---
@@ -578,7 +624,7 @@ queue.process('send-weekly-report', async (job) => {
 | Layer | Technology |
 |---|---|
 | Frontend | React, Angular |
-| Backend | NestJS, Node.js |
+| Backend | Python, FastAPI, asyncpg |
 | Database | PostgreSQL (with RLS) |
 | Cache | Redis |
 | Search | Elasticsearch |
@@ -631,7 +677,7 @@ Explain:
 
 Cover all layers:
 1. `tenant_id` column on every table
-2. Tenant middleware that extracts and sets context
+2. A FastAPI dependency that validates tenant membership
 3. Scoped repositories that inject `tenant_id` automatically
 4. PostgreSQL RLS as the last line of defense
 
@@ -662,7 +708,7 @@ Cover:
 
 **Q: How would you prevent one tenant from seeing another tenant's data?**
 
-> Use multiple layers: tenant middleware validates the JWT's `tenantId` on every request; all repository queries automatically include `WHERE tenant_id = ?`; PostgreSQL Row-Level Security enforces it at the DB level. This defense-in-depth means a single missed check doesn't cause a breach.
+> Use multiple layers: the FastAPI dependency verifies the signed-in user’s membership in the selected tenant on every request; all repository queries automatically include `WHERE tenant_id = ?`; PostgreSQL Row-Level Security enforces it at the DB level. This defense-in-depth means a single missed check doesn't cause a breach.
 
 ---
 
@@ -698,7 +744,7 @@ Cover:
 | No migration strategy | DB changes break thousands of tenants | Always use expand-contract pattern |
 | Forgetting noisy neighbor | One tenant kills the platform | Per-tenant rate limiting and quotas |
 | No RBAC discussion | Authorization is tenant-scoped | Explain tenant-aware RBAC |
-| Treating tenantId as optional | Root cause of most data breaches | Enforce at middleware, repo, and DB |
+| Treating tenantId as optional | Queries can run outside the intended tenant | Verify tenant access in the route dependency, repository, and database |
 | One-size-fits-all architecture | Startups ≠ enterprises | Always explain hybrid/tiered models |
 | Ignoring compliance | Deal-breaker for enterprise sales | Mention GDPR, HIPAA, SOC 2 where relevant |
 
@@ -735,7 +781,7 @@ TENANCY MODEL
 DATA ISOLATION
  [ ] tenant_id on every table
  [ ] Index on tenant_id
- [ ] Tenant middleware on every request
+ [ ] Verified tenant context on every tenant-scoped request
  [ ] Scoped repositories
  [ ] PostgreSQL Row-Level Security
 
